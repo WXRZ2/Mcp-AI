@@ -9,9 +9,7 @@ import {
 
 export { mcpServers, mcpToolRegistry };
 
-const AUTO_SYNC_COOLDOWN_MS = 15000;
 const AUTO_SYNC_TIMEOUT_MS = 10000;
-const lastSyncAt = new Map();
 const inflightSyncs = new Map();
 
 export function matchesServerFilter(server, targetFilter = "") {
@@ -176,7 +174,6 @@ async function connectRemote({
   };
   if (persist) {
     mcpServers.set(id, server);
-    lastSyncAt.set(id, Date.now());
     rebuildMcpToolRegistry();
     await saveServerToStorage();
   }
@@ -227,7 +224,6 @@ async function syncSingleServer(server) {
       if (!current) return false;
       refreshed.status = current.status;
       mcpServers.set(server.id, refreshed);
-      lastSyncAt.set(server.id, Date.now());
 
       const nextSignature = JSON.stringify(refreshed.tools.map(({ key, rawName, description, inputSchema }) => ({ key, rawName, description, inputSchema })));
       if (previousSignature !== nextSignature) {
@@ -255,12 +251,9 @@ async function syncSingleServer(server) {
 }
 
 export async function syncMcpServers(targetFilter = "") {
-  const now = Date.now();
-  const candidates = Array.from(mcpServers.values()).filter((server) => {
-    if (server.status !== "active" || !matchesServerFilter(server, targetFilter)) return false;
-    if (inflightSyncs.has(server.id)) return true;
-    return now - (lastSyncAt.get(server.id) || 0) >= AUTO_SYNC_COOLDOWN_MS;
-  });
+  const candidates = Array.from(mcpServers.values()).filter(
+    (server) => server.status === "active" && matchesServerFilter(server, targetFilter)
+  );
   if (candidates.length === 0) return;
   const results = await Promise.all(candidates.map((server) => syncSingleServer(server)));
   if (results.some(Boolean)) {
