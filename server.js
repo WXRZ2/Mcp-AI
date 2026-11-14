@@ -32,6 +32,8 @@ import {
   loadMcpServersFromStorage,
   connectToMcpServer,
   updateMcpServer,
+  syncMcpServers,
+  matchesServerFilter,
   callMcpTool,
   rebuildMcpToolRegistry
 } from "./src/mcp.js";
@@ -96,14 +98,11 @@ await loadSettingsFromStorage();
 await clearLegacyAiConfiguration();
 
 function getExportedMcpTools(targetFilter = "") {
-  const filter = String(targetFilter || "").trim().toLowerCase();
   const tools = [];
   const seenNames = new Set();
   for (const server of mcpServers.values()) {
     if (server.status !== "active" || !Array.isArray(server.tools)) continue;
-    const serverName = String(server.name || "").trim().toLowerCase();
-    const serverId = String(server.id || "").trim().toLowerCase();
-    if (filter && filter !== "all" && serverName !== filter && serverId !== filter && !serverName.includes(filter) && !filter.includes(serverName)) continue;
+    if (!matchesServerFilter(server, targetFilter)) continue;
     for (const tool of server.tools) {
       if (tool.enabled === false || !tool.key || !mcpToolRegistry.has(tool.key)) continue;
       let name = tool.rawName || tool.key;
@@ -148,6 +147,7 @@ async function handleMcpMessage(message, serverFilter, reqUrl, clientIp) {
   if (method === "ping") return { jsonrpc: "2.0", id, result: {} };
 
   if (method === "tools/list") {
+    await syncMcpServers(serverFilter);
     const tools = getExportedMcpTools(serverFilter);
     addDebugLog("MCP_LIST", `返回 ${tools.length} 个 MCP 工具`, {
       path: reqUrl.pathname, serverFilter: serverFilter || "全部服务", tools: tools.map((tool) => tool.name)

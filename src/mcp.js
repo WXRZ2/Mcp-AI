@@ -9,6 +9,19 @@ import {
 
 export { mcpServers, mcpToolRegistry };
 
+const AUTO_SYNC_COOLDOWN_MS = 15000;
+const AUTO_SYNC_TIMEOUT_MS = 10000;
+const lastSyncAt = new Map();
+const inflightSyncs = new Map();
+
+export function matchesServerFilter(server, targetFilter = "") {
+  const filter = String(targetFilter || "").trim().toLowerCase();
+  if (!filter || filter === "all") return true;
+  const serverName = String(server?.name || "").trim().toLowerCase();
+  const serverId = String(server?.id || "").trim().toLowerCase();
+  return serverName === filter || serverId === filter || serverName.includes(filter) || filter.includes(serverName);
+}
+
 export async function parseMcpResponse(response) {
   const contentType = response.headers.get("Content-Type") || "";
   const text = await response.text();
@@ -70,7 +83,17 @@ export function rebuildMcpToolRegistry() {
   for (const server of mcpServers.values()) registerServer(server);
 }
 
-async function connectRemote({ id = crypto.randomUUID(), name, url, token, previousTools = [], status = "active" }) {
+async function connectRemote({
+  id = crypto.randomUUID(),
+  name,
+  url,
+  token,
+  previousTools = [],
+  status = "active",
+  timeoutMs = 20000,
+  persist = true,
+  log = true
+}) {
   const cleanName = String(name || "").trim();
   const cleanUrl = String(url || "").trim().replace(/\/+$/, "");
   if (!cleanName || !cleanUrl) throw new Error("名称与 MCP 服务地址不能为空");
@@ -99,7 +122,7 @@ async function connectRemote({ id = crypto.randomUUID(), name, url, token, previ
       method: "initialize",
       params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "mcp-proxy", version: "1.0.0" } }
     }),
-    signal: AbortSignal.timeout(20000)
+    signal: AbortSignal.timeout(timeoutMs)
   });
   if (!initResponse.ok) {
     const text = await initResponse.text();
@@ -116,14 +139,14 @@ async function connectRemote({ id = crypto.randomUUID(), name, url, token, previ
     method: "POST",
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
-    signal: AbortSignal.timeout(20000)
+    signal: AbortSignal.timeout(timeoutMs)
   }).catch(() => {});
 
   const listResponse = await fetch(cleanUrl, {
     method: "POST",
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
-    signal: AbortSignal.timeout(20000)
+    signal: AbortSignal.timeout(timeoutMs)
   });
   if (!listResponse.ok) {
     const text = await listResponse.text();
@@ -151,10 +174,13 @@ async function connectRemote({ id = crypto.randomUUID(), name, url, token, previ
     toolCount: tools.length,
     tools
   };
-  mcpServers.set(id, server);
-  rebuildMcpToolRegistry();
-  await saveServerToStorage();
-  addDebugLog("MCP_SERVER", `MCP 服务已连接: ${cleanName}`, { serverId: id, url: cleanUrl, toolCount: tools.length });
+  if (persist) {
+    mcpServers.set(id, server);
+    lastSyncAt.set(id, Date.now());
+    rebuildMcpToolRegistry();
+    await saveServerToStorage();
+  }
+  if (log) addDebugLog("MCP_SERVER", `MCP 服务已连接: ${cleanName}`, { serverId: id, url: cleanUrl, toolCount: tools.length });
   return server;
 }
 
@@ -176,6 +202,71 @@ export async function updateMcpServer({ id, name, url, token }) {
   });
   addDebugLog("MCP_SERVER", `MCP 服务配置已更新: ${updated.name}`, { serverId: id, url: updated.url, toolCount: updated.toolCount });
   return updated;
+}
+
+async function syncSingleServer(server) {
+  const existingTask = inflightSyncs.get(server.id);
+  if (existingTask) return existingTask;
+
+  const task = (async () => {
+    const previousTools = Array.isArray(server.tools) ? server.tools : [];
+    const previousSignature = JSON.stringify(previousTools.map(({ key, rawName, description, inputSchema }) => ({ key, rawName, description, inputSchema })));
+    try {
+      const refreshed = await connectRemote({
+        id: server.id,
+        name: server.name,
+        url: server.url,
+        token: server.headers?.Authorization || "",
+        previousTools,
+        status: server.status,
+        timeoutMs: AUTO_SYNC_TIMEOUT_MS,
+        persist: false,
+        log: false
+      });
+      const current = mcpServers.get(server.id);
+      if (!current) return false;
+      refreshed.status = current.status;
+      mcpServers.set(server.id, refreshed);
+      lastSyncAt.set(server.id, Date.now());
+
+      const nextSignature = JSON.stringify(refreshed.tools.map(({ key, rawName, description, inputSchema }) => ({ key, rawName, description, inputSchema })));
+      if (previousSignature !== nextSignature) {
+        addDebugLog("MCP_SERVER", `已自动同步最新工具: ${refreshed.name} (${previousTools.length} -> ${refreshed.toolCount})`, {
+          serverId: refreshed.id,
+          url: refreshed.url,
+          toolCount: refreshed.toolCount
+        });
+      }
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      addDebugLog("ERROR", `自动拉取 MCP 工具失败，继续使用缓存 [${server.name}]: ${message}`, {
+        serverId: server.id,
+        url: server.url
+      });
+      return false;
+    } finally {
+      inflightSyncs.delete(server.id);
+    }
+  })();
+
+  inflightSyncs.set(server.id, task);
+  return task;
+}
+
+export async function syncMcpServers(targetFilter = "") {
+  const now = Date.now();
+  const candidates = Array.from(mcpServers.values()).filter((server) => {
+    if (server.status !== "active" || !matchesServerFilter(server, targetFilter)) return false;
+    if (inflightSyncs.has(server.id)) return true;
+    return now - (lastSyncAt.get(server.id) || 0) >= AUTO_SYNC_COOLDOWN_MS;
+  });
+  if (candidates.length === 0) return;
+  const results = await Promise.all(candidates.map((server) => syncSingleServer(server)));
+  if (results.some(Boolean)) {
+    rebuildMcpToolRegistry();
+    await saveServerToStorage();
+  }
 }
 
 export function extractMcpResultContent(result) {
