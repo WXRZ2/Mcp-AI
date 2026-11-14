@@ -20,7 +20,7 @@ const LEGACY_CHANNELS_FILE = path.join(PROJECT_ROOT, "mcp-channels.json");
 export const mcpServers = new Map();
 export const mcpToolRegistry = new Map();
 export let loggingEnabled = true;
-export const MAX_LOGS = 1000;
+export const MAX_LOGS = 150;
 export const mcpCallLogs = [];
 
 export function addDebugLog(type, summary, detail = "") {
